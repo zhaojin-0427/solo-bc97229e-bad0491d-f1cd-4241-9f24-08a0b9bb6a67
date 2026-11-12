@@ -19,7 +19,30 @@ def make_config(grid_rows=200, grid_cols=200, max_upload=256,
     cfg.MAX_WINDOW_COLS = max_window
     cfg.MAX_BODY_BYTES = max_body
     cfg.BUSY_TIMEOUT_MS = 10_000
+    cfg.REAP_LOCK_WAIT_MS = 10_000
     cfg.DATA_DIR = tmp
+    cfg.ensure_dirs()
+    return cfg
+
+
+def make_config_at(data_dir, grid_rows=200, grid_cols=200):
+    """指向**已有共享数据目录**的配置（多进程/多实例共用目录测试用）。
+
+    与 :func:`make_config` 相同的小网格参数，但不新建临时目录，
+    可被 pickle（只传字符串路径），适合 spawn 出来的子进程重建。
+    """
+    cfg = Config.__new__(Config)
+    cfg.GRID_ROWS = grid_rows
+    cfg.GRID_COLS = grid_cols
+    cfg.BLOCK_SIZE = 64
+    cfg.MAX_UPLOAD_ROWS = 256
+    cfg.MAX_UPLOAD_COLS = 256
+    cfg.MAX_WINDOW_ROWS = 256
+    cfg.MAX_WINDOW_COLS = 256
+    cfg.MAX_BODY_BYTES = 4 * 1024 * 1024
+    cfg.BUSY_TIMEOUT_MS = 10_000
+    cfg.REAP_LOCK_WAIT_MS = 10_000
+    cfg.DATA_DIR = data_dir
     cfg.ensure_dirs()
     return cfg
 

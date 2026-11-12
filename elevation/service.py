@@ -10,7 +10,9 @@ from .config import Config
 from .database import Database, IntegrityError
 from .errors import (ConflictError, OutOfBoundsError, StorageError,
                      ValidationError)
+from .locking import UploadGuard, read_lock
 from .parsing import parse_int_grid
+from .reaper import startup_reap
 
 
 @dataclass
@@ -46,7 +48,16 @@ class ElevationService:
         self.db = Database(config, self.store)
 
     def initialize(self) -> Dict[str, List[str]]:
-        return self.db.initialize()
+        """安全启动：先在跨进程锁保护下回收，再建库建表/校验元信息。
+
+        顺序很关键——多进程共用目录时，另一个进程可能正持有 SQLite 写锁做上传。
+        先做文件回收（只竞争 flock，等待活体读窗口，不与上传的写事务冲突），
+        再执行需要写锁的 schema 初始化，避免启动期撞上 ``database is locked``。
+        ``reap_once`` 内部对表缺失是容忍的（首次启动库尚不存在）。
+        """
+        report = startup_reap(self.config, self.db, self.store)
+        self.db.initialize_schema()
+        return report
 
     # ================= 导入 =================
     def import_csv(self, stream: BinaryIO,
@@ -93,88 +104,92 @@ class ElevationService:
         unchanged_blocks = 0
         total_new_cells = 0
 
-        try:
-            with self.db.write_transaction() as conn:
-                for (br, bc), incoming in grouped.items():
-                    existing_row = self.db.find_block(conn, br, bc)
-                    existing_cells: Dict[Tuple[int, int], int] = {}
-                    if existing_row is not None:
-                        try:
-                            existing_cells = self.store.read_block(
-                                br, bc, existing_row["filename"])
-                        except (OSError, BlockFormatError) as exc:
-                            raise StorageError(f"读取已有块 ({br},{bc}) 失败: {exc}") from exc
+        # 上传守护：写任何 tmp/块文件之前先登记，全程持跨进程排他锁，
+        # 使其他进程的启动回收不会把本上传的在途文件误判为孤儿删除。
+        with UploadGuard(cfg) as guard:
+            try:
+                with self.db.write_transaction() as conn:
+                    for (br, bc), incoming in grouped.items():
+                        existing_row = self.db.find_block(conn, br, bc)
+                        existing_cells: Dict[Tuple[int, int], int] = {}
+                        if existing_row is not None:
+                            try:
+                                existing_cells = self.store.read_block(
+                                    br, bc, existing_row["filename"])
+                            except (OSError, BlockFormatError) as exc:
+                                raise StorageError(
+                                    f"读取已有块 ({br},{bc}) 失败: {exc}") from exc
 
-                    # 冲突检测：重叠格等值复用，异值整次拒绝。
-                    for (lr, lc), new_value in incoming.items():
-                        old_value = existing_cells.get((lr, lc))
-                        if old_value is not None and old_value != new_value:
-                            gr, gc = br * cfg.BLOCK_SIZE + lr, bc * cfg.BLOCK_SIZE + lc
-                            raise ConflictError(
-                                f"格 ({gr},{gc}) 已存在值 {old_value}，"
-                                f"本次提交值 {new_value} 不一致，整次拒绝")
+                        # 冲突检测：重叠格等值复用，异值整次拒绝。
+                        for (lr, lc), new_value in incoming.items():
+                            old_value = existing_cells.get((lr, lc))
+                            if old_value is not None and old_value != new_value:
+                                gr, gc = br * cfg.BLOCK_SIZE + lr, bc * cfg.BLOCK_SIZE + lc
+                                raise ConflictError(
+                                    f"格 ({gr},{gc}) 已存在值 {old_value}，"
+                                    f"本次提交值 {new_value} 不一致，整次拒绝")
 
-                    merged = dict(existing_cells)
-                    added = 0
-                    for coord, value in incoming.items():
-                        if coord not in merged:
-                            added += 1
-                        merged[coord] = value  # 等值覆盖结果相同
+                        merged = dict(existing_cells)
+                        added = 0
+                        for coord, value in incoming.items():
+                            if coord not in merged:
+                                added += 1
+                            merged[coord] = value  # 等值覆盖结果相同
 
-                    if added == 0 and existing_row is not None:
-                        # 全部为等值复用：不产生新版本，保留原块文件。
-                        unchanged_blocks += 1
-                        continue
+                        if added == 0 and existing_row is not None:
+                            # 全部为等值复用：不产生新版本，保留原块文件。
+                            unchanged_blocks += 1
+                            continue
 
-                    filename = self.store.write_block(br, bc, merged)
-                    new_files.append(filename)
-                    if existing_row is not None:
-                        replaced_files.append(existing_row["filename"])
-                    merged_blocks.append((br, bc, filename, len(merged), added))
-                    total_new_cells += added
+                        filename = self.store.write_block(br, bc, merged, guard=guard)
+                        new_files.append(filename)
+                        if existing_row is not None:
+                            replaced_files.append(existing_row["filename"])
+                        merged_blocks.append((br, bc, filename, len(merged), added))
+                        total_new_cells += added
 
-                if not merged_blocks:
-                    # 纯等值复用提交：仍记录一条 commit，便于审计；不改动任何块。
-                    commit_id = self.db.next_commit_id(conn)
-                    conn.execute(
-                        "INSERT INTO commits(commit_id, row_offset, col_offset, "
-                        "rows, cols, cell_count) VALUES(?,?,?,?,?,?)",
-                        (commit_id, row_offset, col_offset, up_rows, up_cols,
-                         up_rows * up_cols))
-                    self._bump_meta(conn, 0)
-                else:
-                    commit_id = self.db.next_commit_id(conn)
-                    for br, bc, filename, filled, _added in merged_blocks:
+                    if not merged_blocks:
+                        # 纯等值复用提交：仍记录一条 commit，便于审计；不改动任何块。
+                        commit_id = self.db.next_commit_id(conn)
                         conn.execute(
-                            "INSERT INTO blocks(br, bc, filename, filled_cells, commit_id) "
-                            "VALUES(?,?,?,?,?) "
-                            "ON CONFLICT(br, bc) DO UPDATE SET "
-                            "filename=excluded.filename, "
-                            "filled_cells=excluded.filled_cells, "
-                            "commit_id=excluded.commit_id",
-                            (br, bc, filename, filled, commit_id))
-                    for old_name in replaced_files:
+                            "INSERT INTO commits(commit_id, row_offset, col_offset, "
+                            "rows, cols, cell_count) VALUES(?,?,?,?,?,?)",
+                            (commit_id, row_offset, col_offset, up_rows, up_cols,
+                             up_rows * up_cols))
+                        self._bump_meta(conn, 0)
+                    else:
+                        commit_id = self.db.next_commit_id(conn)
+                        for br, bc, filename, filled, _added in merged_blocks:
+                            conn.execute(
+                                "INSERT INTO blocks(br, bc, filename, filled_cells, commit_id) "
+                                "VALUES(?,?,?,?,?) "
+                                "ON CONFLICT(br, bc) DO UPDATE SET "
+                                "filename=excluded.filename, "
+                                "filled_cells=excluded.filled_cells, "
+                                "commit_id=excluded.commit_id",
+                                (br, bc, filename, filled, commit_id))
+                        for old_name in replaced_files:
+                            conn.execute(
+                                "INSERT INTO obsolete_files(filename, created_commit) "
+                                "VALUES(?, ?) ON CONFLICT(filename) DO NOTHING",
+                                (old_name, commit_id))
                         conn.execute(
-                            "INSERT INTO obsolete_files(filename, created_commit) "
-                            "VALUES(?, ?) ON CONFLICT(filename) DO NOTHING",
-                            (old_name, commit_id))
-                    conn.execute(
-                        "INSERT INTO commits(commit_id, row_offset, col_offset, "
-                        "rows, cols, cell_count) VALUES(?,?,?,?,?,?)",
-                        (commit_id, row_offset, col_offset, up_rows, up_cols,
-                         up_rows * up_cols))
-                    self._bump_meta(conn, total_new_cells)
-        except ConflictError:
-            self._rollback_files(new_files)
-            raise
-        except IntegrityError as exc:  # SQLite 索引/磁盘完整性问题
-            self._rollback_files(new_files)
-            raise StorageError(str(exc)) from exc
-        except Exception as exc:  # noqa: BLE001 - 任何写盘/提交失败都保证无部分更新
-            self._rollback_files(new_files)
-            if isinstance(exc, (ValidationError, OutOfBoundsError)):
+                            "INSERT INTO commits(commit_id, row_offset, col_offset, "
+                            "rows, cols, cell_count) VALUES(?,?,?,?,?,?)",
+                            (commit_id, row_offset, col_offset, up_rows, up_cols,
+                             up_rows * up_cols))
+                        self._bump_meta(conn, total_new_cells)
+            except ConflictError:
+                self._rollback_files(new_files)
                 raise
-            raise StorageError(f"写入失败，已回滚本次全部改动: {exc}") from exc
+            except IntegrityError as exc:  # SQLite 索引/磁盘完整性问题
+                self._rollback_files(new_files)
+                raise StorageError(str(exc)) from exc
+            except Exception as exc:  # noqa: BLE001 - 任何写盘/提交失败都保证无部分更新
+                self._rollback_files(new_files)
+                if isinstance(exc, (ValidationError, OutOfBoundsError)):
+                    raise
+                raise StorageError(f"写入失败，已回滚本次全部改动: {exc}") from exc
 
         return ImportResult(
             commit_id=commit_id, rows=up_rows, cols=up_cols,
@@ -220,27 +235,30 @@ class ElevationService:
         filled = 0
         blocks_read = 0
 
-        with self.db.read_transaction() as conn:
-            snapshot = self.db.next_commit_id(conn) - 1  # 当前最大已提交 commit
-            br_lo, br_hi = row_offset // cfg.BLOCK_SIZE, \
-                (row_offset + rows - 1) // cfg.BLOCK_SIZE
-            bc_lo, bc_hi = col_offset // cfg.BLOCK_SIZE, \
-                (col_offset + cols - 1) // cfg.BLOCK_SIZE
+        # 共享回收锁覆盖整个窗口：从固定 WAL 快照到读完所有块文件为止。
+        # 期间其他进程的启动回收拿不到排他锁，故快照需要的旧块不会被删除。
+        with read_lock(cfg):
+            with self.db.read_transaction() as conn:
+                snapshot = self.db.next_commit_id(conn) - 1  # 当前最大已提交 commit
+                br_lo, br_hi = row_offset // cfg.BLOCK_SIZE, \
+                    (row_offset + rows - 1) // cfg.BLOCK_SIZE
+                bc_lo, bc_hi = col_offset // cfg.BLOCK_SIZE, \
+                    (col_offset + cols - 1) // cfg.BLOCK_SIZE
 
-            for row in self.db.iter_window_blocks(conn, br_lo, br_hi, bc_lo, bc_hi):
-                br, bc = row["br"], row["bc"]
-                try:
-                    cells = self.store.read_block(br, bc, row["filename"])
-                except (OSError, BlockFormatError) as exc:
-                    raise StorageError(f"读取块 ({br},{bc}) 失败: {exc}") from exc
-                blocks_read += 1
-                g_r0, g_c0 = br * cfg.BLOCK_SIZE, bc * cfg.BLOCK_SIZE
-                for (lr, lc), value in cells.items():
-                    gr, gc = g_r0 + lr, g_c0 + lc
-                    if row_offset <= gr < row_offset + rows and \
-                            col_offset <= gc < col_offset + cols:
-                        values[gr - row_offset][gc - col_offset] = value
-                        filled += 1
+                for row in self.db.iter_window_blocks(conn, br_lo, br_hi, bc_lo, bc_hi):
+                    br, bc = row["br"], row["bc"]
+                    try:
+                        cells = self.store.read_block(br, bc, row["filename"])
+                    except (OSError, BlockFormatError) as exc:
+                        raise StorageError(f"读取块 ({br},{bc}) 失败: {exc}") from exc
+                    blocks_read += 1
+                    g_r0, g_c0 = br * cfg.BLOCK_SIZE, bc * cfg.BLOCK_SIZE
+                    for (lr, lc), value in cells.items():
+                        gr, gc = g_r0 + lr, g_c0 + lc
+                        if row_offset <= gr < row_offset + rows and \
+                                col_offset <= gc < col_offset + cols:
+                            values[gr - row_offset][gc - col_offset] = value
+                            filled += 1
 
         return WindowResult(
             row_offset=row_offset, col_offset=col_offset, rows=rows, cols=cols,

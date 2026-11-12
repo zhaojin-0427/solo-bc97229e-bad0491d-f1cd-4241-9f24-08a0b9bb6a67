@@ -29,15 +29,17 @@
 ├── app.py                  # Flask 生产入口（create_app 工厂，gunicorn --factory）
 ├── elevation/
 │   ├── config.py           # 全部约束与环境变量配置
-│   ├── blockstore.py       # 64×64 块文件格式、原子写、CRC 校验、启动垃圾回收
-│   ├── database.py         # SQLite schema、WAL、读写事务、崩溃恢复
+│   ├── blockstore.py       # 64×64 块文件格式、原子写、CRC 校验
+│   ├── database.py         # SQLite schema、WAL、读写事务、事务内回收判定
+│   ├── locking.py          # 跨进程 flock：回收读写锁 + 上传守护（多进程共用目录）
+│   ├── reaper.py           # 锁保护下的启动垃圾回收（在途块/快照旧块保护）
 │   ├── parsing.py          # 无表头整数 CSV 流式解析与窗口 CSV 渲染
 │   ├── service.py          # 事务化导入 / 快照窗口取数（核心业务，与框架无关）
 │   ├── handlers.py         # 框架无关的 HTTP 请求处理
 │   ├── http_types.py       # Request/Response 抽象
 │   ├── templates.py        # 网页 HTML（无模板引擎依赖）
 │   └── wsgi_stdlib.py      # 零依赖 WSGI 入口（仅标准库，离线演示用）
-├── tests/                  # 61 个单元/端到端测试（含最小 Flask 契约桩）
+├── tests/                  # 68 个单元/端到端/多进程测试（含最小 Flask 契约桩）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -96,7 +98,8 @@ docker compose up --build
 
 任一阶段失败：SQLite `ROLLBACK` + 本次新块文件全部删除，磁盘与索引回到上传前。
 进程崩溃时：未 rename 的 tmp 文件、已 rename 但无索引引用的孤儿块、
-被替换的旧版本块，均在下次启动 `initialize()` 时识别并回收；
+被替换的旧版本块，均在下次启动 `initialize()` 时，于跨进程锁保护下识别并回收
+（多进程共用目录时会跳过活体上传/在读窗口的文件，详见第 7 节）；
 索引引用的块文件丢失会直接报完整性错误，绝不静默返回错误数据。
 
 ## 6. 配置（环境变量）
@@ -108,21 +111,45 @@ docker compose up --build
 | `ELEV_MAX_WINDOW_ROWS/COLS` | 256 | 窗口上限 |
 | `ELEV_MAX_BODY_BYTES` | 16777216 | 请求体字节上限 |
 | `ELEV_BUSY_TIMEOUT_MS` | 30000 | 写锁排队超时 |
-| `ELEV_DATA_DIR` | `/data` | SQLite、块文件、tmp 的根目录 |
+| `ELEV_REAP_LOCK_WAIT_MS` | 30000 | 启动回收等待“无在读窗口”安全时机的最长时间，超时仅跳过本轮删除、不阻断启动 |
+| `ELEV_DATA_DIR` | `/data` | SQLite、块文件、tmp、跨进程锁（`locks/`）的根目录 |
 | `ELEV_HOST` / `ELEV_PORT` | 0.0.0.0 / 8000 | 零依赖服务器监听地址 |
 
-## 7. 运行测试
+## 7. 多进程共用数据目录的回收竞态与防护
+
+多个 gunicorn worker（或多个容器/进程）挂载**同一个数据目录**时，朴素的
+“启动即删除无引用块”会误删两类活体文件。本系统在数据目录的 `locks/` 下用
+`flock(2)` 做跨进程协调，锁由内核持有，进程退出（含 `SIGKILL`/断电）自动释放：
+
+* **进行中上传 → 上传守护（`upload-*.guard`）**：每次上传进入时创建守护文件并
+  持排他锁，在写任何 tmp/块文件**之前**把文件名 fsync 登记进去。启动回收扫描到
+  仍被持有的守护，就把其登记文件全部排除；进程退出后锁释放，残留守护成为“死守护”，
+  其无引用产物在下一次启动按孤儿回收。
+* **在读窗口 → 回收读写锁（`reaper.lock`）**：窗口读取从固定 WAL 快照到读完块文件
+  全程持**共享锁**（多读并存），启动回收持**排他锁**。因此只有在没有任何在读窗口时
+  才会删除 obsolete 旧块，固定旧快照的窗口始终读得到它需要的旧块。
+* **有界等待，不停用回收、不拒绝共用目录**：回收排他锁在 `ELEV_REAP_LOCK_WAIT_MS`
+  内等待安全时机；超时或仍有活体上传时本轮**跳过删除**并在 stderr 记录 `deferred`，
+  服务照常启动，下一次启动再回收。进程退出后的孤儿块/tmp/死守护不会丢失，后续启动必被回收。
+* 真正删除块的判定在单个 `BEGIN IMMEDIATE` 事务内完成，与上传写事务互斥，
+  扫描期间不存在“已写块未提交”被误判孤儿的窗口。
+
+> `flock` 在 Linux 本地卷与 Docker 命名卷上均为内核级可靠语义。
+
+## 8. 运行测试
 
 ```bash
 ./run_tests.sh
 ```
 
-61 个测试覆盖：块编解码/CRC、CSV 规则、跨块原子提交、等值复用与异值整次拒绝、
+68 个测试覆盖：块编解码/CRC、CSV 规则、跨块原子提交、等值复用与异值整次拒绝、
 多线程并发（不相交/同格等值/同格异值）、快照隔离、重启持久化、
 崩溃垃圾回收、写盘与提交失败回滚、配置漂移防护、完整 HTTP 端到端流程、
-Flask 入口接线（契约桩）。
+Flask 入口接线（契约桩），以及**真正多进程（`multiprocessing`）编排的回收竞态
+回归**：在途块/tmp 保护、窗口快照旧块保护、等待安全时机后回收、
+进程崩溃后的孤儿/死守护回收、多在途文件与回收并发收敛。
 
-## 8. 块文件格式
+## 9. 块文件格式
 
 每个 `.blk` 文件固定 16 910 字节，小端：
 

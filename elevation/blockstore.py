@@ -116,12 +116,24 @@ class BlockStore:
 
     # ---------- 写 ----------
     def write_block(self, br: int, bc: int,
-                    cells: Dict[Tuple[int, int], int]) -> str:
-        """原子写入一个新版本块，返回最终文件名（不含目录）。"""
+                    cells: Dict[Tuple[int, int], int],
+                    guard=None) -> str:
+        """原子写入一个新版本块，返回最终文件名（不含目录）。
+
+        ``guard`` 为可选的 :class:`elevation.locking.UploadGuard`：在创建任何
+        tmp/块文件**之前**先登记文件名，使多进程启动回收不会把进行中上传
+        已落盘、尚未提交索引的块误判为孤儿删除。
+        """
         payload = encode_block(br, bc, cells)
         name = block_filename(br, bc)
-        tmp_path = os.path.join(self.tmp_dir, name + ".tmp")
+        tmp_name = name + ".tmp"
+        tmp_path = os.path.join(self.tmp_dir, tmp_name)
         final_path = os.path.join(self.blocks_dir, name)
+        if guard is not None:
+            # 先登记 tmp 与最终名，再开始写盘：回收者任何时刻看到的在途文件
+            # 都能在某个活体守护的登记清单中找到。
+            guard.claim(tmp_name)
+            guard.claim(name)
         fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         try:
             with os.fdopen(fd, "wb") as fh:
@@ -164,7 +176,12 @@ class BlockStore:
             pass
 
     def cleanup_tmp(self) -> List[str]:
-        """清理 tmp 目录中崩溃遗留的临时文件，返回被清理的文件名列表。"""
+        """无条件清理 tmp 目录中的全部 ``.tmp`` 文件，返回被清理的文件名。
+
+        仅适用于确定没有并发上传的场景（如离线工具）。多进程共用数据目录的
+        启动回收走 :mod:`elevation.reaper`，它会先按上传守护清单跳过活体上传
+        仍在使用的 tmp，避免误删在途文件。
+        """
         removed: List[str] = []
         with os.scandir(self.tmp_dir) as it:
             for entry in it:

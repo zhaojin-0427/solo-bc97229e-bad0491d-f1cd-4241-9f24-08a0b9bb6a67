@@ -8,7 +8,9 @@
   跨块改动一起可见、不覆盖他人已成功格”的事务要求。
 * 读事务使用延迟 ``BEGIN`` 获取一次 WAL 快照，窗口内所有块查询都落在
   同一已提交状态上（快照隔离）。
-* 启动时与 BlockStore 协同做崩溃恢复：回收临时文件、孤儿块、旧版本块。
+* 崩溃恢复的“判定 + 删除”由 :mod:`elevation.reaper` 在跨进程锁保护下完成，
+  本模块只提供在单个写事务内运行的 :meth:`Database.reap_once`，保证多进程
+  共用数据目录时不会误删进行中上传或在读快照需要的文件。
 
 内存约束：索引查询全部走 (br,bc) 主键点查 / 小范围扫描，
 任何流程都不会把整张网格或全部已填格索引加载进内存。
@@ -18,7 +20,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import contextmanager
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Set
 
 from .blockstore import BlockStore, is_block_filename
 from .config import Config
@@ -86,25 +88,34 @@ class Database:
             conn.close()
 
     # ---------- 初始化 / 恢复 ----------
-    def initialize(self) -> Dict[str, List[str]]:
-        """建库建表、写入网格元信息、执行崩溃恢复。返回回收报告。"""
-        self.config.ensure_dirs()
-        report = {"tmp": [], "obsolete": [], "orphan": []}
-        with self.connection() as conn:
-            conn.execute("PRAGMA journal_mode = WAL")
-            # FULL 保证 WAL 已落盘后才确认提交，断电也不丢已成功的上传。
-            conn.execute("PRAGMA synchronous = FULL")
-            conn.executescript(SCHEMA)
-            self._upsert_meta_once(conn, "grid_rows", str(self.config.GRID_ROWS))
-            self._upsert_meta_once(conn, "grid_cols", str(self.config.GRID_COLS))
-            self._upsert_meta_once(conn, "block_size", str(self.config.BLOCK_SIZE))
-            self._upsert_meta_once(conn, "filled_cells", "0")
-            self._check_grid_dims(conn)
+    def initialize_schema(self) -> None:
+        """建库建表并写入/校验网格元信息。崩溃文件回收由 reaper 在锁保护下另行执行。
 
-        # 崩溃遗留的临时块（rename 前崩溃）直接清掉。
-        report["tmp"] = self.store.cleanup_tmp()
-        report["obsolete"], report["orphan"] = self._reap_blocks()
-        return report
+        多进程共用目录时，另一进程可能正持有 SQLite 写锁做上传。建表/元信息写入
+        都是幂等的 ``IF NOT EXISTS`` 操作，若此刻拿不到写锁，说明库与表已由别的
+        进程建好，本轮跳过 DDL（稍后的读路径仍可正常工作）；网格维度校验放到能
+        读到 ``meta`` 时再做，读不锁库，不会因写锁占用而误判。
+        """
+        self.config.ensure_dirs()
+        try:
+            with self.connection() as conn:
+                conn.execute("PRAGMA journal_mode = WAL")
+                # FULL 保证 WAL 已落盘后才确认提交，断电也不丢已成功的上传。
+                conn.execute("PRAGMA synchronous = FULL")
+                conn.executescript(SCHEMA)
+                self._upsert_meta_once(conn, "grid_rows", str(self.config.GRID_ROWS))
+                self._upsert_meta_once(conn, "grid_cols", str(self.config.GRID_COLS))
+                self._upsert_meta_once(conn, "block_size", str(self.config.BLOCK_SIZE))
+                self._upsert_meta_once(conn, "filled_cells", "0")
+                self._check_grid_dims(conn)
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            # 写锁被在途上传占用：库表已存在，仅尝试只读校验维度（读不阻塞）。
+            with self.connection() as conn:
+                if self._tables_ready(conn):
+                    self._check_grid_dims(conn)
+                # 表尚不可见且库被锁的极端情况留给后续请求/下次启动处理。
 
     def _upsert_meta_once(self, conn: sqlite3.Connection, key: str, value: str) -> None:
         conn.execute(
@@ -121,51 +132,71 @@ class Database:
                     f"数据目录中的 {key}={rows[key]} 与当前配置 {expected} 不一致，"
                     "拒绝启动以避免越界写入")
 
-    def _reap_blocks(self) -> Tuple[List[str], List[str]]:
-        """删除 obsolete_files 中及任何不被索引引用的块文件。分批处理，避免大 IN 列表。"""
+    def reap_once(self, protected: Set[str]) -> Dict[str, List[str]]:
+        """在调用方已取得回收排他锁、且无活体上传/读快照的前提下执行一轮回收。
+
+        ``protected`` 是活体上传守护登记的文件名集合（块名与 tmp 名），其中的
+        文件一律不删。整个判定与删除包在单个 ``BEGIN IMMEDIATE`` 事务内：
+        与任何上传写事务互斥，因此扫描期间不会有“已写块但未提交”的新文件
+        从活体上传落入“孤儿”判定（活体文件已在 ``protected`` 中被排除）。
+
+        返回 ``{"obsolete": [...], "orphan": [...]}`` 的回收清单。
+        首次启动（数据库/表尚未创建）时直接返回空清单，由随后的 schema 初始化建表。
+        """
+        if not os.path.exists(self.db_path):
+            return {"obsolete": [], "orphan": []}
         removed_obsolete: List[str] = []
         removed_orphan: List[str] = []
         with self.connection() as conn:
-            referenced: set[str] = set()
-            for row in conn.execute("SELECT filename FROM blocks"):
-                referenced.add(row["filename"])
+            # 库文件存在但表可能还没建（早期崩溃）：确认表齐备后才回收。
+            if not self._tables_ready(conn):
+                return {"obsolete": [], "orphan": []}
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                referenced: Set[str] = set()
+                for row in conn.execute("SELECT filename FROM blocks"):
+                    referenced.add(row["filename"])
 
-            obsolete: set[str] = set()
-            for row in conn.execute("SELECT filename FROM obsolete_files"):
-                obsolete.add(row["filename"])
+                obsolete: Set[str] = set()
+                for row in conn.execute("SELECT filename FROM obsolete_files"):
+                    obsolete.add(row["filename"])
 
-            # 索引引用的文件必须存在，否则数据已不可恢复，明确报错而不是静默。
-            for name in referenced:
-                if not os.path.exists(self.store.block_path(name)):
-                    raise IntegrityError(f"索引引用的块文件丢失: {name}")
+                # 索引引用的文件必须存在，否则数据已不可恢复，明确报错而不是静默。
+                for name in referenced:
+                    if not os.path.exists(self.store.block_path(name)):
+                        raise IntegrityError(f"索引引用的块文件丢失: {name}")
 
-            for name in self.store.iter_disk_files():
-                if name in referenced:
-                    continue
-                if name in obsolete:
-                    self.store.remove_file(name)
-                    removed_obsolete.append(name)
-                elif is_block_filename(name):
-                    # 已写新块文件但事务未提交就崩溃 —— 无人引用，安全删除。
-                    self.store.remove_file(name)
-                    removed_orphan.append(name)
-                else:
+                for name in self.store.iter_disk_files():
+                    if name in referenced or name in protected:
+                        continue
+                    if name in obsolete:
+                        self.store.remove_file(name)
+                        removed_obsolete.append(name)
+                    elif is_block_filename(name):
+                        # 已写新块文件但事务未提交（且无活体上传守护）——
+                        # 持锁进程已退出的崩溃遗留，安全删除。
+                        self.store.remove_file(name)
+                        removed_orphan.append(name)
                     # 无法识别的文件不臆测，保留不动。
-                    pass
 
-            if removed_obsolete:
-                conn.execute("BEGIN IMMEDIATE")
-                try:
+                if removed_obsolete:
                     for i in range(0, len(removed_obsolete), 200):
                         batch = removed_obsolete[i:i + 200]
                         conn.executemany(
                             "DELETE FROM obsolete_files WHERE filename = ?",
                             [(n,) for n in batch])
-                    conn.execute("COMMIT")
-                except BaseException:
-                    conn.execute("ROLLBACK")
-                    raise
-        return removed_obsolete, removed_orphan
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return {"obsolete": removed_obsolete, "orphan": removed_orphan}
+
+    @staticmethod
+    def _tables_ready(conn: sqlite3.Connection) -> bool:
+        need = {"meta", "commits", "blocks", "obsolete_files"}
+        found = {r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        return need.issubset(found)
 
     # ---------- 事务 ----------
     @contextmanager

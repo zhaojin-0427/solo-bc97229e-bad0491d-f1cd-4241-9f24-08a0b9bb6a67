@@ -32,6 +32,11 @@ class Config:
     # SQLite 写锁等待（毫秒），并发上传在此排队。
     BUSY_TIMEOUT_MS = _int_env("ELEV_BUSY_TIMEOUT_MS", 30_000)
 
+    # 启动回收等待安全时机（无进程正在窗口读取）的最长时间（毫秒）。
+    # 超时则本次启动跳过文件删除（绝不误删进行中的读快照/上传），
+    # 待下次启动再回收；不影响服务正常启动。
+    REAP_LOCK_WAIT_MS = _int_env("ELEV_REAP_LOCK_WAIT_MS", 30_000)
+
     # 数据目录：SQLite 索引 + 64×64 块文件 + 临时文件。
     DATA_DIR = os.environ.get("ELEV_DATA_DIR", "/data")
 
@@ -47,10 +52,20 @@ class Config:
     def tmp_dir(self) -> str:
         return os.path.join(self.DATA_DIR, "tmp")
 
+    @property
+    def locks_dir(self) -> str:
+        # 跨进程 flock 协调：回收读写锁 + 进行中上传的守护标记。
+        return os.path.join(self.DATA_DIR, "locks")
+
+    @property
+    def reap_lock_path(self) -> str:
+        return os.path.join(self.locks_dir, "reaper.lock")
+
     def ensure_dirs(self) -> None:
         os.makedirs(self.DATA_DIR, exist_ok=True)
         os.makedirs(self.blocks_dir, exist_ok=True)
         os.makedirs(self.tmp_dir, exist_ok=True)
+        os.makedirs(self.locks_dir, exist_ok=True)
 
 
 CONFIG = Config()
